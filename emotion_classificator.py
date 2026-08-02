@@ -1,13 +1,20 @@
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+from config import Config
+from custom_logger import CustomLogger
 from tensorflow import keras
 from tensorflow.keras import layers
+
+logger = CustomLogger(
+    logger_log_level=Config.CLI_LOG_LEVEL,
+    file_handler_log_level=Config.FILE_LOG_LEVEL,
+    log_file_name=Config.LOGS_PATH
+).create_logger()
 
 
 @keras.utils.register_keras_serializable()
