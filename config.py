@@ -1,8 +1,5 @@
-import json
 import logging
-import os
 from pathlib import Path
-from typing import Union
 
 #  $env:DATA_UPLOAD_MAX_NUMBER_FILES="10000" 
 
@@ -60,3 +57,4 @@ class Config:
     # LOGGER
     CLI_LOG_LEVEL: int = logging.DEBUG
     FILE_LOG_LEVEL: int = logging.DEBUG
+    LOGS_PATH: Path = ROOT_PATH / "logs" / "logs.log"
