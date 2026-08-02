@@ -21,7 +21,15 @@ Zależności: numpy, scipy.
 from __future__ import annotations
 
 import numpy as np
+from config import Config
+from custom_logger import CustomLogger
 from scipy.optimize import linear_sum_assignment
+
+logger = CustomLogger(
+    logger_log_level=Config.CLI_LOG_LEVEL,
+    file_handler_log_level=Config.FILE_LOG_LEVEL,
+    log_file_name=Config.LOGS_PATH
+).create_logger()
 
 # ----------------------------------------------------------------------------
 # Konwersje boxów (wszystkie wektorowe)
@@ -289,6 +297,14 @@ class Sort:
         self.iou_threshold = iou_threshold
         self.per_class = per_class
         self.emit_predicted = emit_predicted
+
+        logger.info("Init EmotionTimeline with: \n"\
+                            f"{self.max_age=}\n" \
+                            f"{self.min_hits=}\n" \
+                            f"{self.iou_threshold=}\n" \
+                            f"{self.per_class=}\n" \
+                            f"{self.emit_predicted=}\n" \
+                    )
 
         self.kf = kf if kf is not None else KalmanFilterXYWH()
         self.tracks: list[Track] = []
