@@ -1,8 +1,15 @@
-"""Agregacja emocji w przedzialy czasowe, odporna na zmienna przepustowosc petli."""
-
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from statistics import median
+
+from config import Config
+from custom_logger import CustomLogger
+
+logger = CustomLogger(
+    logger_log_level=Config.CLI_LOG_LEVEL,
+    file_handler_log_level=Config.FILE_LOG_LEVEL,
+    log_file_name=Config.LOGS_PATH
+).create_logger()
 
 
 @dataclass
@@ -25,17 +32,17 @@ class _OpenInterval:
 
 class EmotionTimeline:
     """
-    Zamienia strumien (obj_id, emocja, conf, timestamp) na liste przedzialow czasowych.
+    Converts the stream (obj_id, emotion, conf, timestamp) into a list of time intervals.
 
-    Parametry sa w SEKUNDACH, nie w klatkach - dzieki temu dzialaja tak samo
-    przy 30 klatkach na sekunde i przy 0.5, bez recznego strojenia.
+    The parameters are in SECONDS, not frames - this ensures they work the same
+    at 30 frames per second and at 0.5, without the need for manual tuning.
 
-    smoothing_seconds - dlugosc okna glosowania (stabilizacja predykcji CNN)
-    min_votes         - tyle ostatnich probek zostaje w oknie nawet gdy sa starsze
-    min_conf          - predykcje ponizej tej pewnosci nie glosuja
-    min_duration      - przedzialy krotsze niz tyle sekund sa wyrzucane
-    max_gap           - None = auto (gap_factor x zmierzony odstep miedzy probkami)
-    gap_factor        - ile odstepow bez twarzy oznacza, ze zniknela z kadru
+    smoothing_seconds - the length of the voting window (CNN prediction stabilisation)
+    min_votes         - this is the number of most recent samples retained in the window, even if they are older
+    min_conf          - predictions below this confidence threshold do not count
+    min_duration      - intervals shorter than this number of seconds are discarded
+    max_gap           - None = auto (gap_factor x the measured interval between samples)
+    gap_factor        - the number of intervals without a face that indicates it has disappeared from the frame - ile odstepow bez twarzy oznacza, ze zniknela z kadru
     """
 
     def __init__(self,
@@ -52,6 +59,15 @@ class EmotionTimeline:
         self.max_gap = max_gap
         self.gap_factor = gap_factor
 
+        logger.info("Init EmotionTimeline with:\n"\
+                    f"{self.smoothing_seconds=}\n" \
+                    f"{self.min_votes=}\n" \
+                    f"{self.min_conf=}\n" \
+                    f"{self.min_duration=}\n" \
+                    f"{self.max_gap=}\n" \
+                    f"{self.gap_factor=}\n" \
+            )
+
         self._deltas: deque[float] = deque(maxlen=31)
         self._last_ts: float | None = None
 
@@ -61,7 +77,7 @@ class EmotionTimeline:
 
     @property
     def sampling_interval(self) -> float | None:
-        """Zmierzony odstep miedzy przetworzonymi klatkami (mediana, odporna na zacieci)."""
+        """The measured spacing between processed frames (median, jam-resistant)."""
         return median(self._deltas) if len(self._deltas) >= 3 else None
 
     @property
@@ -77,7 +93,7 @@ class EmotionTimeline:
         return max(self.gap_factor * si, 2 * self.min_duration) if si else float("inf")
 
     def _note_timestamp(self, timestamp: float) -> None:
-        """Mierzy odstepy miedzy KLATKAMI, nie miedzy twarzami na jednej klatce."""
+        """It measures the spacing between FRAMES, not between faces within a single frame."""
         if self._last_ts is None:
             self._last_ts = timestamp
         elif timestamp > self._last_ts:
@@ -85,7 +101,7 @@ class EmotionTimeline:
             self._last_ts = timestamp
 
     def update(self, obj_id: int, emotion: str, conf: float, timestamp: float) -> str | None:
-        """Wywoluj raz na klatke dla kazdej wykrytej twarzy. Zwraca wygladzona emocje."""
+        """Execute once per frame sar for each detected face. Returns a smoothed emotion."""
         self._note_timestamp(timestamp)
 
         votes = self._votes[obj_id]
@@ -123,8 +139,8 @@ class EmotionTimeline:
         if current is None:
             return
 
-        # Probka "pokrywa" czas do nastepnej spodziewanej probki - inaczej przy wolnym
-        # przetwarzaniu pojedyncza obserwacja mialaby dlugosc 0 i zniknelaby z raportu.
+        # A sample 'covers' the period until the next expected sample – otherwise, with slow
+        # processing, a single observation would have a duration of 0 and would disappear from the report.
         if pad and end <= current.start:
             end = current.start + (self.sampling_interval or 0)
 
