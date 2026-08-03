@@ -1,4 +1,4 @@
-from collections import deque
+import sys
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,11 +7,18 @@ from time import perf_counter
 import cv2
 import numpy as np
 from config import Config
+from custom_logger import CustomLogger
 from emotion_classificator import EmotionClassification
 from emotion_plots import save_plots
 from sort_tracker import Sort
 from timeline_tracker import EmotionTimeline
 from yolo_detector import YoloDetector
+
+logger = CustomLogger(
+    logger_log_level=Config.CLI_LOG_LEVEL,
+    file_handler_log_level=Config.FILE_LOG_LEVEL,
+    log_file_name=Config.LOGS_PATH
+).create_logger()
 
 
 @dataclass
@@ -34,24 +41,61 @@ class EmotionAnalyze:
     sort_iou_thr: float = Config.SORT_IOU_THRESHOLD
 
     def __post_init__(self) -> None:
-        self.model_path = self.model_folder / self.model_name
-        self.yolo_detector = YoloDetector(
-            model_path=self.model_path,
-            classes_path=self.classes_path,
-            device=self.device
-        )
-        self.sort_alg = Sort(
-            max_age=self.sort_max_age,
-            min_hits=self.sort_min_hits,
-            iou_threshold=self.sort_iou_thr
-        )
-        self.emotion_classificator = EmotionClassification(
-            model_path=self.cnn_model_folder / self.cnn_model_name,
-            meta_path=self.cnn_model_folder / self.cnn_meta_name
-        )
+        logger.info("Init EmotionAnalyze with:\n"\
+                f"{self.model_folder=}\n" \
+                f"{self.model_name=}\n" \
+                f"{self.classes_path=}\n" \
+                f"{self.device=}\n" \
+                f"{self.cnn_model_folder=}\n" \
+                f"{self.cnn_model_name=}\n" \
+                f"{self.cnn_meta_name=}\n" \
+                f"{self.sort_max_age=}\n" \
+                f"{self.sort_min_hits=}\n" \
+                f"{self.sort_iou_thr=}\n" \
+            )
 
-        with open(self.classes_path) as f:
-            self.class_names = f.read().split("\n")
+        init_error = 0
+
+        self.model_path = self.model_folder / self.model_name
+        try:
+            self.yolo_detector = YoloDetector(
+                model_path=self.model_path,
+                classes_path=self.classes_path,
+                device=self.device
+            )
+        except Exception as e:
+            logger.exception("Error when initing yolo detector.")
+            init_error += 1
+
+        try:
+            self.sort_alg = Sort(
+                max_age=self.sort_max_age,
+                min_hits=self.sort_min_hits,
+                iou_threshold=self.sort_iou_thr
+            )
+        except Exception as e:
+            logger.exception("Error when initing yolo detector.")
+            init_error += 1
+
+        try:
+            self.emotion_classificator = EmotionClassification(
+                model_path=self.cnn_model_folder / self.cnn_model_name,
+                meta_path=self.cnn_model_folder / self.cnn_meta_name
+            )
+        except Exception as e:
+            logger.exception("Error when initing emotion classificator.")
+            init_error += 1
+
+        try:
+            with open(self.classes_path) as f:
+                self.class_names = f.read().split("\n")
+        except (FileNotFoundError, PermissionError, IsADirectoryError):
+            logger.exception("Error when reading classes file.")
+            init_error += 1
+
+        if init_error:
+            logger.error("One of key components didn't load, check logs. Exiting...")
+            sys.exit(1)
 
     def yolo_detect(self,
                     images: list[np.ndarray],
