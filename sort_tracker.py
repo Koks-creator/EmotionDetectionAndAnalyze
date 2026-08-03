@@ -1,21 +1,21 @@
 """
-SORT (Simple Online and Realtime Tracking) — przepisana implementacja.
+SORT (Simple Online and Realtime Tracking) — a rewritten implementation.
 
-Różnice względem oryginału (abewley/sort, 2016):
-  * brak filterpy — własny filtr Kalmana, z BATCHOWANĄ predykcją i korekcją:
-    N tracków to kilka operacji macierzowych, a nie N wywołań w Pythonie
-  * parametryzacja stanu (cx, cy, w, h) zamiast (cx, cy, s, r) — patrz BoT-SORT;
-    znika problem sqrt(ujemne pole) i źle dopasowanych boxów
-  * szum procesowy i pomiarowy skalowany rozmiarem obiektu zamiast stałego Q
-  * asocjacja Hungarianem (scipy) zamiast greedy
-  * IoU liczone macierzowo, bez pętli po Pythonie
-  * spójna obsługa class_id (bramkowanie + głosowanie ważone confidence)
-  * zatrzaskiwane potwierdzenie tracku i jawna flaga predykcji w wyjściu
+Differences from the original (abewley/sort, 2016):
+  * no filterpy — custom Kalman filter, with BATCHED prediction and correction:
+    N tracks involve a few matrix operations, rather than N Python calls
+  * state parameterisation (cx, cy, w, h) instead of (cx, cy, s, r) — see BoT-SORT;
+    the problem of sqrt(negative array) and poorly fitted boxes is eliminated
+  * process and measurement noise scaled by object size instead of a constant Q
+  * Hungarian association (scipy) instead of greedy
+  * IoU calculated via matrix operations, without Python loops
+  * consistent handling of class_id (thresholding + confidence-weighted voting)
+  * latch-based track confirmation and explicit prediction flag in the output
 
-Format wejścia:  (N, 6) -> [x1, y1, x2, y2, conf, class_id]
-Format wyjścia:  (M, 8) -> [x1, y1, x2, y2, conf, track_id, class_id, is_predicted]
+Input format:  (N, 6) -> [x1, y1, x2, y2, conf, class_id]
+Output format:  (M, 8) -> [x1, y1, x2, y2, conf, track_id, class_id, is_predicted]
 
-Zależności: numpy, scipy.
+Dependencies: numpy, scipy.
 """
 
 from __future__ import annotations
@@ -31,13 +31,7 @@ logger = CustomLogger(
     log_file_name=Config.LOGS_PATH
 ).create_logger()
 
-# ----------------------------------------------------------------------------
-# Konwersje boxów (wszystkie wektorowe)
-# ----------------------------------------------------------------------------
-
-
 def xyxy_to_xywh(boxes: np.ndarray) -> np.ndarray:
-    """(N, 4) [x1, y1, x2, y2] -> (N, 4) [cx, cy, w, h]."""
     boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
     out = np.empty_like(boxes)
     out[:, 2] = boxes[:, 2] - boxes[:, 0]
@@ -48,10 +42,8 @@ def xyxy_to_xywh(boxes: np.ndarray) -> np.ndarray:
 
 
 def xywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
-    """(N, 4) [cx, cy, w, h] -> (N, 4) [x1, y1, x2, y2]."""
     boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
-    # Przy długiej ekstrapolacji prędkość vw/vh potrafi wypchnąć w/h poniżej zera
-    # i box wychodzi odwrócony. Oryginał robił tu sqrt(s*r) i dostawał NaN.
+
     w = np.maximum(boxes[:, 2], 1e-6)
     h = np.maximum(boxes[:, 3], 1e-6)
     out = np.empty_like(boxes)
@@ -64,14 +56,14 @@ def xywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
 
 def iou_batch(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
     """
-    Macierz IoU między dwoma zbiorami boxów [x1, y1, x2, y2].
+    IoU matrix between two sets of boxes [x1, y1, x2, y2].
 
     Args:
         boxes_a: (N, 4)
         boxes_b: (M, 4)
 
     Returns:
-        (N, M) macierz IoU
+        (N, M) IoU matrix
     """
     boxes_a = np.asarray(boxes_a, dtype=np.float64).reshape(-1, 4)
     boxes_b = np.asarray(boxes_b, dtype=np.float64).reshape(-1, 4)
@@ -94,25 +86,25 @@ def iou_batch(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------------
-# Filtr Kalmana
+# Filter
 # ----------------------------------------------------------------------------
 
 
 class KalmanFilterXYWH:
     """
-    Filtr Kalmana o stałej prędkości dla boxów (cx, cy, w, h).
+    Constant-velocity Kalman filter for boxes (cx, cy, w, h).
 
-    Stan 8-wymiarowy: [cx, cy, w, h, vx, vy, vw, vh].
-    Pomiar 4-wymiarowy: [cx, cy, w, h].
+    8-dimensional state: [cx, cy, w, h, vx, vy, vw, vh].
+    4-dimensional measurement: [cx, cy, w, h].
 
-    Dwie rzeczy, których SORT nie robił:
+    Two things that SORT did not do:
 
-    1. Szum nie jest stały, tylko proporcjonalny do rozmiaru obiektu. Box
-       o wysokości 20 px i box o wysokości 400 px nie mają tej samej niepewności
-       położenia — stałe Q udaje, że mają.
-    2. Wszystko liczy się dla całej paczki tracków naraz. To jedyny powód, dla
-       którego warto pisać ten filtr samemu zamiast brać filterpy: filterpy
-       wymusza predict()/update() per obiekt.
+    1. The noise is not constant, but proportional to the size of the object. A box
+       20 px high and a box 400 px high do not have the same position uncertainty
+       — a constant Q pretends that they do.
+    2. Everything is calculated for the entire batch of tracks at once. This is the only reason
+       why it's worth writing this filter yourself rather than using filterpy: filterpy
+       enforces predict()/update() per object.
     """
 
     _ndim = 4
@@ -129,7 +121,6 @@ class KalmanFilterXYWH:
         self.std_velocity = std_velocity
 
     def initiate(self, measurement: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Zainicjuj track z pojedynczego pomiaru [cx, cy, w, h]."""
         mean = np.concatenate([measurement, np.zeros(self._ndim)])
         w, h = measurement[2], measurement[3]
         std = np.array([
@@ -148,7 +139,7 @@ class KalmanFilterXYWH:
         self, means: np.ndarray, covariances: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Krok predykcji dla wszystkich tracków naraz.
+        Prediction step for all tracks at once.
 
         Args:
             means: (N, 8)
@@ -164,7 +155,7 @@ class KalmanFilterXYWH:
             self.std_velocity * w, self.std_velocity * h,
             self.std_velocity * w, self.std_velocity * h,
         ], axis=1)
-        # (N, 8) -> (N, 8, 8) macierze diagonalne, bez pętli
+        # (N, 8) -> (N, 8, 8)
         motion_cov = np.square(std)[:, :, None] * self._eye_state[None, :, :]
 
         means = means @ self._motion_mat.T
@@ -175,10 +166,10 @@ class KalmanFilterXYWH:
         self, means: np.ndarray, covariances: np.ndarray, measurements: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Krok korekcji dla wszystkich dopasowanych tracków naraz.
+        A correction step for all matched tracks at once.
 
-        Wzmocnienie liczone przez np.linalg.solve zamiast jawnej odwrotności —
-        stabilniej numerycznie i solve broadcastuje po wymiarze paczki.
+        Gain calculated using, for example, `linalg.solve` instead of the explicit inverse —
+        numerically more stable, and `solve` broadcasts along the batch dimension.
 
         Args:
             means: (N, 8)
@@ -199,7 +190,7 @@ class KalmanFilterXYWH:
         projected_mean = means @ H.T                                  # (N, 4)
         projected_cov = H @ covariances @ H.T + innovation_cov        # (N, 4, 4)
 
-        # K = P Hᵀ S⁻¹  <=>  S Kᵀ = (P Hᵀ)ᵀ   (S symetryczna)
+        # K = P Hᵀ S⁻¹  <=>  S Kᵀ = (P Hᵀ)ᵀ   (S simetry)
         pht = covariances @ H.T                                       # (N, 8, 4)
         gain = np.linalg.solve(projected_cov, pht.transpose(0, 2, 1)).transpose(0, 2, 1)
 
@@ -210,16 +201,16 @@ class KalmanFilterXYWH:
 
 
 # ----------------------------------------------------------------------------
-# Pojedynczy track
+# Single track
 # ----------------------------------------------------------------------------
 
 
 class Track:
     """
-    Pojedyncza hipoteza o obiekcie.
+    A single hypothesis about the object.
 
-    Trzyma tylko stan i księgowość — arytmetykę filtra robi Sort zbiorczo.
-    Wszystko wewnątrz jest w formacie (cx, cy, w, h); konwersje są na granicy.
+    It only maintains state and accounting — the filter’s arithmetic is handled by Sort in batches.
+    Everything inside is in the format (cx, cy, w, h); conversions take place at the boundaries.
     """
 
     _count: int = 0
@@ -231,16 +222,13 @@ class Track:
         self.id: int = Track._count
 
         self.conf: float = float(conf)
-        # Głosowanie ważone confidence zamiast klasy zamrożonej w pierwszej klatce.
+        # Confidence-weighted voting instead of a class frozen in the first frame.
         self._class_votes: dict[int, float] = {int(class_id): float(conf)}
 
         self.time_since_update: int = 0
         self.hits: int = 1
         self.hit_streak: int = 1
         self.age: int = 0
-        # Zatrzask. W oryginalnym SORT hit_streak jest zerowany po każdej nieudanej
-        # klatce, więc track po każdej luce znika z wyjścia na min_hits klatek —
-        # z punktu widzenia konsumenta wygląda to jak utrata i nadanie nowego ID.
         self.confirmed: bool = False
 
     @property
@@ -262,7 +250,7 @@ class Track:
 
     @staticmethod
     def reset_id_counter() -> None:
-        """Wołaj między sekwencjami wideo, inaczej ID rosną w nieskończoność."""
+        """Call between video sequences, otherwise the IDs will increase indefinitely."""
         Track._count = 0
 
 
@@ -274,13 +262,13 @@ class Track:
 class Sort:
     """
     Args:
-        max_age: ile klatek bez detekcji track przeżywa, zanim zostanie usunięty
-        min_hits: ile trafień potrzeba, zanim track trafi na wyjście
-        iou_threshold: minimalne IoU uznawane za dopasowanie
-        per_class: jeśli True, detekcja dopasuje się tylko do tracku tej samej klasy
-        emit_predicted: jeśli True, tracki bez detekcji w bieżącej klatce też trafiają
-            na wyjście, oznaczone is_predicted=1 — przydatne przy okluzjach, ale
-            konsument MUSI tę flagę czytać, bo to ekstrapolacja, nie pomiar
+        max_age: the number of frames a track can survive without detection before it is removed
+        min_hits: the number of hits required before a track is output
+        iou_threshold: the minimum IoU considered a match
+        per_class: if True, a detection will only match a track of the same class
+        emit_predicted: if True, tracks without a detection in the current frame are also included
+            in the output, marked with is_predicted=1 — useful for occlusions, but
+            the consumer MUST read this flag, as this is extrapolation, not a measurement
     """
 
     def __init__(
@@ -311,24 +299,24 @@ class Sort:
         self.frame_count: int = 0
 
     def reset(self) -> None:
-        """Wyczyść stan i licznik ID — przed nową sekwencją."""
+        """Clear the status and ID counter — before a new sequence."""
         self.tracks = []
         self.frame_count = 0
         Track.reset_id_counter()
 
     def _track_boxes(self) -> np.ndarray:
-        """Boxy wszystkich tracków jako (N, 4) xyxy — jedna konwersja na klatkę."""
+        """The boxes for all tracks are of the form (N, 4) xyxy — one conversion per frame."""
         if not self.tracks:
             return np.empty((0, 4))
         return xywh_to_xyxy(np.stack([t.mean[:4] for t in self.tracks]))
 
     def update(self, dets: np.ndarray | list | None = None) -> np.ndarray:
         """
-        Wołaj RAZ NA KLATKĘ, także wtedy, gdy nie ma żadnych detekcji —
-        inaczej tracki nie starzeją się i nie wygasają.
+        Call ONCE PER FRAME, even when no detections are present —
+        otherwise, tracks will not age or expire.
 
         Args:
-            dets: (N, 6) [x1, y1, x2, y2, conf, class_id], albo None / []
+            dets: (N, 6) [x1, y1, x2, y2, conf, class_id], or None / []
 
         Returns:
             (M, 8) [x1, y1, x2, y2, conf, track_id, class_id, is_predicted]
@@ -340,7 +328,7 @@ class Sort:
         else:
             dets = np.asarray(dets, dtype=np.float64).reshape(-1, 6)
 
-        # --- predykcja (cała paczka jednym mnożeniem) --------------------------
+        # --- prediction (the whole set with a single multiplication) --------------------------
         if self.tracks:
             means = np.stack([t.mean for t in self.tracks])
             covs = np.stack([t.covariance for t in self.tracks])
@@ -349,10 +337,10 @@ class Sort:
                 t.mean, t.covariance = m, c
                 t.mark_missed()
 
-        # --- asocjacja ---------------------------------------------------------
+        # --- association ---------------------------------------------------------
         matched, unmatched_dets = self._associate(dets)
 
-        # --- korekcja (też jedną paczką) --------------------------------------
+        # --- correction (also in a single batch) --------------------------------------
         if matched:
             det_idx = np.array([d for d, _ in matched])
             trk_idx = [t for _, t in matched]
@@ -367,13 +355,13 @@ class Sort:
                 trk.mean, trk.covariance = m, c
                 trk.mark_hit(dets[d, 4], int(dets[d, 5]))
 
-        # --- nowe tracki -------------------------------------------------------
+        # --- new tracks -------------------------------------------------------
         if len(unmatched_dets):
             new_meas = xyxy_to_xywh(dets[unmatched_dets, :4])
             for meas, d in zip(new_meas, unmatched_dets):
                 self.tracks.append(Track(meas, dets[d, 4], int(dets[d, 5]), self.kf))
 
-        # --- wyjście i sprzątanie ---------------------------------------------
+        # --- quitting and cleaning ---------------------------------------------
         boxes = self._track_boxes()
         results: list[list[float]] = []
         surviving: list[Track] = []
@@ -401,7 +389,7 @@ class Sort:
         return np.array(results, dtype=np.float64) if results else np.empty((0, 8))
 
     def _associate(self, dets: np.ndarray) -> tuple[list[tuple[int, int]], list[int]]:
-        """Przypisanie węgierskie na macierzy IoU, z bramkowaniem progiem i klasą."""
+        """Hungarian assignment on an IoU matrix, with threshold and class-based labelling."""
         if len(self.tracks) == 0 or len(dets) == 0:
             return [], list(range(len(dets)))
 
@@ -412,11 +400,11 @@ class Sort:
             trk_cls = np.array([t.class_id for t in self.tracks], dtype=np.float64)[None, :]
             iou_matrix = np.where(det_cls == trk_cls, iou_matrix, 0.0)
 
-        # Hungarian minimalizuje koszt, więc maksymalizujemy IoU przez znak minus
+        # Hungarian minimises the cost, so we maximise the IoU using the minus sign
         row_idx, col_idx = linear_sum_assignment(-iou_matrix)
 
-        # Hungarian przypisze wszystko, co się da, także pary o IoU = 0 —
-        # próg odsiewamy dopiero po fakcie
+        # Hungarian will assign everything it can, including pairs with IoU = 0 —
+        # we only filter out the threshold after the fact
         keep = iou_matrix[row_idx, col_idx] >= self.iou_threshold
         matched = [(int(r), int(c)) for r, c in zip(row_idx[keep], col_idx[keep])]
 
@@ -424,8 +412,6 @@ class Sort:
         unmatched_dets = [i for i in range(len(dets)) if i not in matched_dets]
         return matched, unmatched_dets
 
-
-# ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     np.set_printoptions(precision=2, suppress=True)
@@ -435,13 +421,13 @@ if __name__ == "__main__":
     frames = [
         [[10, 10, 50, 50, 0.90, 0], [100, 100, 150, 150, 0.80, 1]],
         [[12, 12, 52, 52, 0.95, 0], [99, 99, 149, 149, 0.85, 1]],
-        [[14, 14, 54, 54, 0.92, 0]],                                # obiekt 2 znika
-        [[16, 16, 56, 56, 0.93, 0], [97, 97, 147, 147, 0.70, 1]],   # i wraca
+        [[14, 14, 54, 54, 0.92, 0]],                                # obj 2 goes away
+        [[16, 16, 56, 56, 0.93, 0], [97, 97, 147, 147, 0.70, 1]],   # and retuns
     ]
 
     for i, dets in enumerate(frames, start=1):
         out = tracker.update(dets)
-        print(f"--- klatka {i} ---")
+        print(f"--- Frame {i} ---")
         print("   x1     y1     x2     y2   conf    id   cls  pred")
         print(out if len(out) else "(brak)")
         print()
