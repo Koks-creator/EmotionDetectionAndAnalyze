@@ -7,6 +7,7 @@ from time import perf_counter
 import cv2
 import numpy as np
 from config import Config
+from custom_decorators import log_call, timeit
 from custom_logger import CustomLogger
 from emotion_classificator import EmotionClassification
 from emotion_plots import save_plots
@@ -40,6 +41,7 @@ class EmotionAnalyze:
     sort_min_hits: int = Config.SORT_MIN_HITS
     sort_iou_thr: float = Config.SORT_IOU_THRESHOLD
 
+    @timeit(logger=logger)
     def __post_init__(self) -> None:
         logger.info("Init EmotionAnalyze with:\n"\
                 f"{self.model_folder=}\n" \
@@ -97,6 +99,14 @@ class EmotionAnalyze:
             logger.error("One of key components didn't load, check logs. Exiting...")
             sys.exit(1)
 
+    @log_call(logger=logger,
+              log_params=[
+                "conf", "iou", "augment",
+                "agnostic_nms", "use_sahi", "sahi_conf",
+                "sahi_slice_height", "sahi_overlap_height_ratio", "sahi_overlap_width_ratio"
+                ],
+                hide_res=True)
+    @timeit(logger=logger)
     def yolo_detect(self,
                     images: list[np.ndarray],
                     conf: float = .35,
@@ -167,7 +177,8 @@ class EmotionAnalyze:
     def draw_bbox(self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, class_name: str, obj_id: int) -> None:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 50, 80), 2, 1)
         cv2.putText(frame, f"{class_name} ID: {obj_id}", (x1, y1-5), cv2.FONT_HERSHEY_PLAIN, 1.4, (200, 50, 80), 2)
-    
+
+    @log_call(logger=logger)
     def run(self,
             video_input: int | Path,
             timeline_smoothing_seconds: float = .3,
